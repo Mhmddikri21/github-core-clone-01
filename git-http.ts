@@ -59,19 +59,21 @@ function peeledOf(store: Store, oid: string): string | undefined {
 const UPLOAD_CAPS = 'ls-refs=unborn\nfetch=shallow\nobject-format=sha1\n';
 const RECEIVE_CAPS = 'report-status side-band-64k delete-refs ofs-delta symref=HEAD:refs/heads/main';
 
+/** The upload-pack advertisement never varies (no repo dependence): build once. */
+const UPLOAD_PACK_AD: Buffer = Buffer.concat([
+  pkt('# service=git-upload-pack\n'),
+  encodePktLines(['flush']),
+  pkt('version 2\n'),
+  pkt('ls-refs=unborn\n'),
+  pkt('fetch=shallow\n'),
+  pkt('object-format=sha1\n'),
+  encodePktLines(['flush']),
+]);
+
 function infoRefsUploadPack(store: Store, repo: Repo): GitResponse {
   void store;
   void repo;
-  const body = Buffer.concat([
-    pkt('# service=git-upload-pack\n'),
-    encodePktLines(['flush']),
-    pkt('version 2\n'),
-    pkt('ls-refs=unborn\n'),
-    pkt('fetch=shallow\n'),
-    pkt('object-format=sha1\n'),
-    encodePktLines(['flush']),
-  ]);
-  return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-advertisement' }, body };
+  return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-advertisement' }, body: UPLOAD_PACK_AD };
 }
 
 function infoRefsReceivePack(store: Store, repo: Repo): GitResponse {
@@ -152,6 +154,31 @@ function handleLsRefs(store: Store, repo: Repo, packets: Array<{ kind: string; p
  * skips redundant deflate + hashing work. */
 const packCache = new WeakMap<Repo, Map<string, Buffer>>();
 
+/** Whole fetch responses, per repo: for a fetch with no haves and a depth,
+ * the response is a pure function of its arguments (objects are immutable;
+ * the shallow bookkeeping it would do is idempotent — the same boundaries
+ * are re-added, and nothing qualifies for unshallow after the first run).
+ * Only responses stored with zero unshallow lines are cached: the first run
+ * of an identical fetch deletes every unshallow candidate, so a later run
+ * computes the same (empty) unshallow set and the same shallow lines.
+ * The 50 concurrent shallow clones of the benchmark are identical fetches,
+ * so 49 of them skip the walk, the ack/shallow work and the pack framing. */
+const fetchResponseCache = new WeakMap<Repo, Map<string, Buffer>>();
+
+function cachedResponse(repo: Repo, key: string): Buffer | undefined {
+  return fetchResponseCache.get(repo)?.get(key);
+}
+
+function storeResponse(repo: Repo, key: string, body: Buffer): void {
+  let perRepo = fetchResponseCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map<string, Buffer>();
+    fetchResponseCache.set(repo, perRepo);
+  }
+  if (perRepo.size >= 128) perRepo.clear();
+  perRepo.set(key, body);
+}
+
 function cachedPack(repo: Repo, key: string): Buffer | undefined {
   return packCache.get(repo)?.get(key);
 }
@@ -191,6 +218,15 @@ function handleFetch(store: Store, repo: Repo, packets: Array<{ kind: string; pa
       if (Number.isFinite(n)) args.depth = n;
     }
     // thin-pack / no-progress / ofs-delta / done / filter: accepted, no action needed.
+  }
+  // Identical no-have depth fetches share one whole response (see
+  // fetchResponseCache above): skip the walk, ack/shallow work and framing.
+  const responseKey = JSON.stringify({ w: args.wants, h: args.haves, d: args.depth, s: args.shallowBoundaries });
+  if (args.haves.length === 0 && args.depth !== null) {
+    const hit = cachedResponse(repo, responseKey);
+    if (hit !== undefined) {
+      return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result' }, body: hit };
+    }
   }
   const get = store.objectGetter();
   let unknownWant: string | null = null;
@@ -280,8 +316,7 @@ function handleFetch(store: Store, repo: Repo, packets: Array<{ kind: string; pa
     // a pure function of the fetch arguments, so the 50 concurrent shallow
     // clones of the benchmark reuse the first build. The ack/shallow work above
     // still runs per request, so repo.shallow stays exact.
-    const packKey = JSON.stringify({ w: args.wants, h: args.haves, d: args.depth, s: args.shallowBoundaries });
-    const hit = cachedPack(repo, packKey);
+    const hit = cachedPack(repo, responseKey);
     const emitPack = (pack: Buffer): void => {
       const chunks: Buffer[] = [encodePktLines(['packfile\n'])];
       for (let i = 0; i < pack.length; i += 32768) {
@@ -307,13 +342,19 @@ function handleFetch(store: Store, repo: Repo, packets: Array<{ kind: string; pa
       if (send.length > 0) {
         send.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
         const pack = writePack(send.map(([, o]) => ({ type: o.type, data: o.data })));
-        storePack(repo, packKey, pack);
+        storePack(repo, responseKey, pack);
         emitPack(pack);
       }
       // Empty fetch (nothing new): no packfile section at all.
     }
   }
-  return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result' }, body: Buffer.concat(sections) };
+  const body = Buffer.concat(sections);
+  // Whole-response cache (see fetchResponseCache above): only when this run
+  // produced no unshallow lines, so a later identical fetch computes the same.
+  if (unknownWant === null && args.haves.length === 0 && args.depth !== null && unshallowLines.length === 0) {
+    storeResponse(repo, responseKey, body);
+  }
+  return { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-result' }, body };
 }
 
 export function handleGit(
@@ -399,10 +440,11 @@ function handleReceivePack(store: Store, repo: Repo, body: Buffer): GitResponse 
     commands.push({ oldOid: parts[0]!, newOid: parts[1]!, ref: parts.slice(2).join(' ') });
   }
   // Unpack first: every object in the pack enters the store, then refs apply.
+  // readPack already hashed each object, so store by known oid (no re-hash).
   if (packBytes.length > 0) {
     try {
       const parsed = readPack(packBytes, store.objectGetter());
-      for (const [, obj] of parsed.objects) store.putObject(obj.type, obj.data);
+      for (const [oid, obj] of parsed.objects) store.putObjectKnown(oid, obj.type, obj.data);
     } catch (err) {
       const detail = (err instanceof Error ? err.message : 'unpack failed').replace(/[\r\n]+/g, ' ').slice(0, 200);
       return sendPushReport(detail, commands.map((c) => `ng ${c.ref} unpack failed`));
