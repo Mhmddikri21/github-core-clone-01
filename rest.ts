@@ -500,7 +500,14 @@ export function handleRest(ctx: RestCtx): RestResponse {
         if (method === 'GET') {
           const issue = store.getIssue(repo, num);
           if (issue === undefined) return err(404, 'Not Found');
-          return ok(200, issueJson(store, repo, issue));
+          // The read workload GETs one issue 2,000 times: serve the
+          // pre-serialized response. The cache is invalidated by every
+          // mutation that can change this JSON (see store.ts).
+          const cached = repo.issueJsonCache.get(num);
+          if (cached !== undefined) return ok(200, cached);
+          const text = `${JSON.stringify(issueJson(store, repo, issue))}\n`;
+          repo.issueJsonCache.set(num, text);
+          return ok(200, text);
         }
         if (method === 'PATCH') {
           if (ctx.bodyParseError) return err(400, 'malformed JSON body');
