@@ -161,6 +161,10 @@ export interface Repo {
   nextPullNumber: number;
   nextLabelId: number;
   shallow: Set<string>;
+  /** Pre-serialized GET-single-issue responses, keyed by issue number.
+   * Cleared (per issue or whole-repo) by every mutation that can change an
+   * issue's JSON: patchIssue, addIssueComment, createLabel. */
+  issueJsonCache: Map<number, string>;
   createdAt: string;
   updatedAt: string;
 }
@@ -333,6 +337,12 @@ export class Store {
     return oid;
   }
 
+  /** Store an object whose oid is already known (e.g. readPack computed it):
+   * skips the re-hash putObject would do. The oid must be hashObject(type, data). */
+  putObjectKnown(oid: string, type: ObjType, data: Buffer): void {
+    if (!this.objects.has(oid)) this.objects.set(oid, { type, data } as GitObject);
+  }
+
   objectGetter(): ObjectGetter {
     return (oid: string) => this.objects.get(oid);
   }
@@ -362,6 +372,7 @@ export class Store {
       nextPullNumber: 1,
       nextLabelId: 7,
       shallow: new Set(),
+      issueJsonCache: new Map(),
       createdAt: FIXED_DATE,
       updatedAt: FIXED_DATE,
     };
@@ -631,6 +642,7 @@ export class Store {
     }
     issue.updatedAt = FIXED_DATE;
     repo.updatedAt = FIXED_DATE;
+    repo.issueJsonCache.delete(number);
     return issue;
   }
 
@@ -647,6 +659,7 @@ export class Store {
     issue.comments.push(comment);
     issue.updatedAt = FIXED_DATE;
     repo.updatedAt = FIXED_DATE;
+    repo.issueJsonCache.delete(issueNumber);
     return comment;
   }
 
@@ -660,6 +673,7 @@ export class Store {
     };
     repo.labels.push(label);
     repo.updatedAt = FIXED_DATE;
+    repo.issueJsonCache.clear();
     return label;
   }
 
